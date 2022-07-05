@@ -1,0 +1,14 @@
+[General]
+    # TriggerIntervalSec represents the trigger interval (in seconds) for the main cron job
+    TriggerIntervalSec = 5
+
+[Alarms]
+    [Alarms.NodeRating]
+        Identifier = "testnet nodes"
+        Threshold = 1.0
+
+        ApiUrl = "http://192.168.169.110:9093"
+        PubKeys = [
+            "225e1792d9fc44fcc1288111c79f43b59dd2ab019ab99d675b3c73439ec8417e94ee0071372e0faf0f061ebbe420ca0fae40e6bce620d0a23e4b6d0ae5ffb61ae95790d942ae1e81f564fce8f41333086bb628af117872d42c28281cc272ad01",
+            "cf5c541aca164be708da42990cb72c8c895a705f9e28b2c41e5c9f2b7315abca4aebed689c5678af973492920e1e82166f37e1a42bdff3360ff3f3e889a15b6d09191b1e0ea8a0051844706762e6892bd4a4f01d4fb75c01652559890995d48c"
+        ]
