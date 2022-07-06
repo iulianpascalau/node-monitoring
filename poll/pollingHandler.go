@@ -3,11 +3,12 @@ package poll
 import (
 	"context"
 	"fmt"
-	"sync/atomic"
 	"time"
 
+	"github.com/ElrondNetwork/elrond-go-core/core/check"
 	"github.com/ElrondNetwork/elrond-go-logger"
 	"github.com/iulianpascalau/node-monitoring/data"
+	"github.com/iulianpascalau/node-monitoring/poll/notifiers"
 )
 
 const pollingInterval = time.Millisecond * 100
@@ -17,30 +18,82 @@ Number of processing error: %d, number of alarms with error: %d`
 
 var log = logger.GetOrCreate("poll")
 
-type pollingHandler struct {
-	*timeOfDayNotifier
-	alarms             []AlarmHandler
-	notifiers          []NotifierHandler
-	numErrors          uint64
-	numAlarmsWithError uint64
-	startTime          time.Time
+// ArgsPollingHandler represents the arguments DTO for the pollingHandler constructor
+type ArgsPollingHandler struct {
+	Alarms         []AlarmHandler
+	Notifiers      []NotifierHandler
+	SendInfo       bool
+	SendInfoHour   int
+	SendInfoMinute int
+	SendInfoSecond int
 }
 
-func NewPollingHandler() (*pollingHandler, error) {
+type pollingHandler struct {
+	notifiers.TimeOfDayNotifier
+	*pollingHandlerState
+	alarms    []AlarmHandler
+	notifiers []NotifierHandler
+	startTime time.Time
+	cancel    func()
+}
 
-	return &pollingHandler{
-		timeOfDayNotifier:  nil,
-		alarms:             nil,
-		notifiers:          nil,
-		numErrors:          0,
-		numAlarmsWithError: 0,
-		startTime:          time.Now(),
-	}, nil
+// NewPollingHandler creates a new polling handler instance
+func NewPollingHandler(args ArgsPollingHandler) (*pollingHandler, error) {
+	err := checkArgs(args)
+	if err != nil {
+		return nil, err
+	}
+
+	timeOfDay, err := notifiers.CreateTimeOfDayNotifier(args.SendInfo, args.SendInfoHour, args.SendInfoMinute, args.SendInfoSecond)
+	if err != nil {
+		return nil, err
+	}
+
+	ph := &pollingHandler{
+		TimeOfDayNotifier:   timeOfDay,
+		pollingHandlerState: &pollingHandlerState{},
+		alarms:              args.Alarms,
+		notifiers:           args.Notifiers,
+		startTime:           time.Now(),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ph.cancel = cancel
+
+	go ph.processLoop(ctx)
+
+	return ph, nil
+}
+
+func checkArgs(args ArgsPollingHandler) error {
+	if len(args.Alarms) == 0 {
+		return errNoAlarmsSet
+	}
+	for idx, alarm := range args.Alarms {
+		if check.IfNil(alarm) {
+			return fmt.Errorf("%w at index %d", errNilAlarmHandler, idx)
+		}
+	}
+
+	if len(args.Notifiers) == 0 {
+		return errNoActiveNotifiers
+	}
+	for idx, notifier := range args.Notifiers {
+		if check.IfNil(notifier) {
+			return fmt.Errorf("%w at index %d", errNilNotifier, idx)
+		}
+	}
+
+	return nil
 }
 
 func (ph *pollingHandler) processLoop(ctx context.Context) {
+	ph.setIsRunning()
 	log.Debug("polling handler's process loop has started...")
-	defer log.Debug("polling handler's process loop has been stopped")
+	defer func() {
+		log.Debug("polling handler's process loop has been stopped")
+		ph.setIsStopped()
+	}()
 
 	for {
 		select {
@@ -53,8 +106,8 @@ func (ph *pollingHandler) processLoop(ctx context.Context) {
 }
 
 func (ph *pollingHandler) poll(ctx context.Context) {
-	if ph.isTimeOfDay(time.Now()) {
-		response := ph.createInfoMessage()
+	if ph.IsTimeOfDay(time.Now()) {
+		response := ph.createInfoMessage(ctx)
 		ph.notifyAll(ctx, response)
 	}
 
@@ -66,7 +119,7 @@ func (ph *pollingHandler) poll(ctx context.Context) {
 		response, err := alarm.Query(ctx)
 		if err != nil {
 			log.Error("error querying alarm", "identifier", alarm.Identifier(), "error", err.Error())
-			atomic.AddUint64(&ph.numErrors, 1)
+			ph.incrementErrors()
 			continue
 		}
 
@@ -76,34 +129,59 @@ func (ph *pollingHandler) poll(ctx context.Context) {
 
 func (ph *pollingHandler) notifyAll(ctx context.Context, response data.AlarmResponse) {
 	if response.Level == data.Error {
-		atomic.AddUint64(&ph.numAlarmsWithError, 1)
+		ph.incrementAlarmsWithError()
 	}
 
 	for _, notifier := range ph.notifiers {
 		err := notifier.ProcessAlarmResponse(ctx, response)
 		if err != nil {
 			log.Error("error pushing notification", "error", err.Error())
-			atomic.AddUint64(&ph.numErrors, 1)
+			ph.incrementErrors()
 			continue
 		}
 	}
 }
 
-func (ph *pollingHandler) createInfoMessage() data.AlarmResponse {
+func (ph *pollingHandler) createInfoMessage(ctx context.Context) data.AlarmResponse {
 	response := data.AlarmResponse{
 		Identifier: systemIdentifier,
 		Level:      data.Info,
 		Data: fmt.Sprintf(systemMessage,
 			time.Since(time.Now()),
-			atomic.LoadUint64(&ph.numErrors),
-			atomic.LoadUint64(&ph.numAlarmsWithError)),
+			ph.getNumErrors(),
+			ph.getNumAlarmsWithError()),
 	}
 
-	atomic.StoreUint64(&ph.numErrors, 0)
-	atomic.StoreUint64(&ph.numAlarmsWithError, 0)
+	if ph.getNumErrors()+ph.getNumAlarmsWithError() > 0 {
+		response.Level = data.Error
+	}
+
+	for _, alarm := range ph.alarms {
+		status, err := alarm.QueryInfo(ctx)
+		if err == nil {
+			response.Data += fmt.Sprintf("\nStatus for alarm %s: %s", alarm.Identifier(), status)
+		} else {
+			response.Data += fmt.Sprintf("\nError fetching status info for alarm %s: %s", alarm.Identifier(), err.Error())
+			response.Level = data.Error
+		}
+	}
+
+	ph.resetNumErrors()
 
 	log.Debug("polling handler creating info message",
-		"time", time.Now(), "identifier", response.Identifier, "level", response.Level, "message", response.Data)
+		"time", time.Now(), "identifier", response.Identifier, "level", response.Level, "message", "\r\n"+response.Data)
 
 	return response
+}
+
+// Close will close the running processLoop go routine
+func (ph *pollingHandler) Close() error {
+	ph.cancel()
+
+	return nil
+}
+
+// IsInterfaceNil returns true if there is no value under the interface
+func (ph *pollingHandler) IsInterfaceNil() bool {
+	return ph == nil
 }

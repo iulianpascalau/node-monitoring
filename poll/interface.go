@@ -10,6 +10,7 @@ import (
 type AlarmHandler interface {
 	ShouldQuery() bool
 	Query(ctx context.Context) (data.AlarmResponse, error)
+	QueryInfo(ctx context.Context) (string, error)
 	Identifier() string
 	IsInterfaceNil() bool
 }
